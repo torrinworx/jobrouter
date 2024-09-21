@@ -120,7 +120,7 @@ class Jobs:
 
 '''
 Example and ideal use case:
-from pyjobs import Jobs, job
+from jobrouter import Jobs, job
 
 jobs = Jobs(dir='./')
 
