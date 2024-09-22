@@ -48,13 +48,9 @@ class JobRequest:
         self,
         name: str,
         args: dict = None,
-        binary_stream: Any = None,
-        websocket: Any = None,
     ):
         self.name = name
         self.args = args or {}
-        self.binary_stream = binary_stream
-        self.websocket = websocket
 
 
 class SingletonMeta(type):
@@ -150,28 +146,8 @@ class Jobs(metaclass=SingletonMeta):
         job_params = inspect.signature(job_func).parameters
         relevant_args = {k: v for k, v in job_request.args.items() if k in job_params}
 
-        possible_context_args = {
-            "binary_stream": "binary_stream",
-            "websocket": "websocket",
-        }
-
-        for param, attr in possible_context_args.items():
-            if param in job_params and hasattr(job_request, attr):
-                relevant_args[param] = getattr(job_request, attr)
-
         result = job_func(**relevant_args)
         if inspect.isasyncgenfunction(job_func):
             return result
         else:
             return await result
-
-    # Routers for different use cases:
-    def websocket_router(self):
-        # receives a websocket, routes the job from the websocket, forwards the websocket onto the job to be run.
-        # TODO: translate websocket to base router: idea, pass in websocket so that jobs can intake websocket.
-        pass
-
-    def binary_stream_router(self):
-        # receives a binary stream, routes the job from the binary stream, passes the binary stream onto the job to be run.
-        # TODO: translate binary stream to base router: idea, pass in binary stream so that jobs can intake binary stream.
-        pass
