@@ -5,9 +5,18 @@ import pathlib
 import importlib.util
 from typing import Optional
 from functools import wraps
+from typing import Optional, Any, Union, AsyncGenerator, Callable
+
 
 def job(name: Optional[str] = None, description: Optional[str] = None):
-    def decorator(func):
+    def decorator(func: Callable[..., Any]):
+        if not asyncio.iscoroutinefunction(func) and not inspect.isasyncgenfunction(
+            func
+        ):
+            raise TypeError(
+                "The job decorator can only be applied to asynchronous functions or async generators."
+            )
+
         job_metadata = {
             "name": name,
             "description": description,
@@ -15,43 +24,56 @@ def job(name: Optional[str] = None, description: Optional[str] = None):
 
         func.job_metadata = job_metadata
 
-        @wraps(func)
-        async def async_wrapper(*args, **kwargs):
-            return await func(*args, **kwargs)
-
-        @wraps(func)
-        def sync_wrapper(*args, **kwargs):
-            return func(*args, **kwargs)
-
         if asyncio.iscoroutinefunction(func):
+
+            @wraps(func)
+            async def async_wrapper(*args, **kwargs):
+                return await func(*args, **kwargs)
+
             return async_wrapper
-        else:
-            return sync_wrapper
+        elif inspect.isasyncgenfunction(func):
+
+            @wraps(func)
+            async def async_gen_wrapper(*args, **kwargs):
+                async for item in func(*args, **kwargs):
+                    yield item
+
+            return async_gen_wrapper
 
     return decorator
 
+
 class JobRequest:
-    def __init__(self, name: str, args: dict = None):
+    def __init__(
+        self,
+        name: str,
+        args: dict = None,
+        binary_stream: Any = None,
+        websocket: Any = None,
+    ):
         self.name = name
         self.args = args or {}
+        self.binary_stream = binary_stream
+        self.websocket = websocket
 
-class Jobs:
-    __instance = None
 
-    def __new__(cls, dir, *args, **kwargs):
-        if cls.__instance is None:
-            cls.__instance = super(Jobs, cls).__new__(cls)
-            cls.__instance.__init_once(dir, *args, **kwargs)
-        return cls.__instance
+class SingletonMeta(type):
+    _instances = {}
 
-    def __init_once(self, dir):
-        if getattr(self, "_is_initialized", False):
-            return
-        self._is_initialized = True
+    def __call__(cls, *args, **kwargs):
+        if cls not in cls._instances:
+            instance = super().__call__(*args, **kwargs)
+            cls._instances[cls] = instance
+        return cls._instances[cls]
 
-        self.directory = os.path.abspath(dir)
-        self.jobs = []
-        self._get_jobs()
+
+class Jobs(metaclass=SingletonMeta):
+    def __init__(self, dir):
+        if not hasattr(self, "initialized"):
+            self.directory = os.path.abspath(dir)
+            self.jobs = []
+            self._get_jobs()
+            self.initialized = True
 
     def _get_jobs(self):
         job_files = self._find_job_files()
@@ -59,20 +81,18 @@ class Jobs:
             self._load_jobs_from_file(filepath)
 
     def _find_job_files(self):
-        return [
-            filepath
-            for filepath in pathlib.Path(self.directory).rglob("*.py")
-            if filepath.name != "__init__.py"
-        ]
+        return [filepath for filepath in pathlib.Path(self.directory).rglob("*.py")]
 
     def _load_jobs_from_file(self, filepath):
         module_name = os.path.splitext(os.path.basename(filepath))[0]
         spec = importlib.util.spec_from_file_location(module_name, filepath)
         module = importlib.util.module_from_spec(spec)
-
-        if spec.loader:
-            spec.loader.exec_module(module)
+        try:
+            if spec.loader:
+                spec.loader.exec_module(module)
             self._extract_jobs_from_module(module)
+        except Exception as e:
+            print(f"Failed to load module {module_name} from {filepath}: {e}")
 
     def _extract_jobs_from_module(self, module):
         for attr in dir(module):
@@ -87,62 +107,71 @@ class Jobs:
                     }
                 )
 
-    # simple base router:
-    async def router(self, job_request: JobRequest):
+    async def router(self, job_request: JobRequest) -> Union[Any, AsyncGenerator]:
         """
-        receives a JobRequest model/dictionary, routes the job from the websocket, forwards the JobRequest arguments to the job to be run. 
-        
-        jobs can be ONLY async functions and can either return or yield results. meaning we have to handle base returns and returned generators.
+        The base router that routes the given job request.
 
-        job_request: basic job definition, the job being requested
+        Receives a JobRequest object, finds and routes the specified job using the
+        job name, and forwards the JobRequest arguments to the job to be executed.
+
+        Only async functions can be registered as jobs. These jobs can either
+        return or yield results.
+
+        Args:
+            job_request (JobRequest): The job request with the name and arguments
+            of the job to be executed.
+
+        Returns:
+            The result of the job function execution or an AsyncGenerator if the
+            function yields results.
+
+        Raises:
+            FileNotFoundError: If the specified job is not found.
+            TypeError: If the specified job function is not asynchronous.
         """
-        job = next((job for job in self.jobs if job.get("name") == job_request.name), None)
+        job = next(
+            (job for job in self.jobs if job.get("name") == job_request.name), None
+        )
+
         if not job:
-            raise FileNotFoundError(f"The job '{job_request.name}' was not found in {self.directory}.")
+            raise FileNotFoundError(
+                f"The job '{job_request.name}' was not found in {self.directory}."
+            )
 
         job_func = job.get("function")
 
-        if inspect.iscoroutinefunction(job_func):
-            return await job_func(**job_request.args)
+        if not inspect.iscoroutinefunction(job_func) and not inspect.isasyncgenfunction(
+            job_func
+        ):
+            raise TypeError(
+                f"The job '{job_request.name}' must be an async function or async generator to be executed."
+            )
+
+        job_params = inspect.signature(job_func).parameters
+        relevant_args = {k: v for k, v in job_request.args.items() if k in job_params}
+
+        possible_context_args = {
+            "binary_stream": "binary_stream",
+            "websocket": "websocket",
+        }
+
+        for param, attr in possible_context_args.items():
+            if param in job_params and hasattr(job_request, attr):
+                relevant_args[param] = getattr(job_request, attr)
+
+        result = job_func(**relevant_args)
+        if inspect.isasyncgenfunction(job_func):
+            return result
         else:
-            raise # Error that says functions must be async for jobs.
+            return await result
 
     # Routers for different use cases:
-    def websocket_router():
+    def websocket_router(self):
         # receives a websocket, routes the job from the websocket, forwards the websocket onto the job to be run.
-        # TODO
+        # TODO: translate websocket to base router: idea, pass in websocket so that jobs can intake websocket.
         pass
 
-    def binary_stream_router():
+    def binary_stream_router(self):
         # receives a binary stream, routes the job from the binary stream, passes the binary stream onto the job to be run.
-        # TODO
+        # TODO: translate binary stream to base router: idea, pass in binary stream so that jobs can intake binary stream.
         pass
-
-'''
-Example and ideal use case:
-from jobrouter import Jobs, job
-
-jobs = Jobs(dir='./')
-
-@job(
-    name="jobs_list",
-    description="List out all available jobs the server can run.",
-)
-async def main():
-    return [{**j, 'function': j['function'].__name__} for j in jobs.jobs]
-
-job = JobRequest(name='job_list')
-result = jobs.router(job)
-print(result) # [{'name': 'jobs_list', 'description': 'List out all available jobs the server can run.'}, {'name': 'addition', 'description': 'Add two numbers together'}]
-
-@job(
-    name="addition",
-    description="Add two numbers together",
-)
-async def main(num1: int, num2: int):
-    return num1 + num2
-
-job = JobRequest(name='addition', args={'num1': 4, 'num2': 9})
-result = jobs.router(job)
-print(result) # 13
-'''
